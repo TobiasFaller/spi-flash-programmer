@@ -32,8 +32,19 @@
 
 #define VERSION "SPI Flash programmer v1.0"
 
+#define AT45DB161D
+
+#ifdef AT45DB161D
+
+#define SECTOR_SIZE 528
+#define PAGE_SIZE 528
+
+#else
+
 #define SECTOR_SIZE 4096
 #define PAGE_SIZE 256
+
+#endif
 
 void dump_buffer(void);
 void dump_buffer_crc(void);
@@ -441,6 +452,8 @@ uint32_t crc_buffer(void)
 // Chip implementation specific code
 // ---------------------------------------------------------------------------
 
+#ifndef AT45DB161D
+
 // SPI opcodes
 #define WREN         0x06
 #define WRDI         0x04
@@ -695,3 +708,95 @@ void impl_status_register_read(void)
   write_hex_u8(statusRegister2);
   write_hex_u8(statusRegister3);
 }
+
+#else
+
+void impl_enable_write(void)
+{
+  SPI.transfer(0x3D); // disable write protection
+  SPI.transfer(0x2A);
+  SPI.transfer(0x7F);
+  SPI.transfer(0x9A);
+}
+
+void impl_erase_chip(void)
+{
+  SPI.transfer(0xC7); // chip erase
+  SPI.transfer(0x94);
+  SPI.transfer(0x80);
+  SPI.transfer(0x9A);
+}
+
+void impl_erase_sector(uint32_t address)
+{
+  SPI.transfer(0x81); // page erase
+  SPI.transfer((address & 0x0FC0) >> 6);
+  SPI.transfer((address & 0x003F) << 2);
+  SPI.transfer(0x00);
+}
+
+void impl_read_page(uint32_t address)
+{
+  SPI.transfer(0xD2); // read without buffer
+  SPI.transfer((address & 0x0FC0) >> 6);
+  SPI.transfer((address & 0x003F) << 2);
+  SPI.transfer(0x00);
+}
+
+void impl_write_page(uint32_t address)
+{
+  uint16_t counter;
+
+  SPI.transfer(0x84); // write buffer 1
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+  SPI.transfer(0x00);
+
+  for (counter = 0; counter < PAGE_SIZE; counter++) {
+    SPI.transfer(buffer[counter]);
+  }
+
+  SPI.transfer(0x83); // write buffer 1 to memory with erase
+  SPI.transfer((address & 0x0FC0) >> 6);
+  SPI.transfer((address & 0x003F) << 2);
+  SPI.transfer(0x00);
+}
+
+void impl_wait_for_write_enable(void)
+{
+  uint8_t statreg = 0x80;
+
+  while(statreg & 0x80) {
+    digitalWrite(SS, LOW);
+
+    SPI.transfer(0xD7); // status register read
+    statreg = SPI.transfer(0xD7);
+
+    digitalWrite(SS, HIGH);
+  }
+}
+
+void impl_write_protection_check()
+{
+  // Unimplemented
+  write_hex_u8(WRITE_PROTECTION_CONFIGURATION_UNKOWN);
+  write_hex_u8(WRITE_PROTECTION_UNKOWN);
+}
+
+void impl_write_protection_enable()
+{
+  ; // Unimplemented
+}
+
+void impl_write_protection_disable()
+{
+  ; // Unimplemented
+}
+
+void impl_status_register_read()
+{
+  write_hex_u8(0); // Unimplemented
+}
+
+#endif
