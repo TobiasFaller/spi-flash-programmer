@@ -84,24 +84,29 @@ usage: spi_flash_programmer_client.py [-h] [-d DEVICE] [-f FILENAME]
                                       [-l LENGTH] [--rate BAUD_RATE]
                                       [--flash-offset FLASH_OFFSET]
                                       [--file-offset FILE_OFFSET]
-                                      {ports,write,read,verify,erase}
+                                      [--debug {off,normal,verbose}]
+                                      {ports,write,read,verify,erase,
+                                       enable-protection,disable-protection,check-protection,
+                                       status-register}
 
 Interface with an Arduino-based SPI flash programmer
 
 positional arguments:
-  {ports,write,read,verify,erase}
+  {ports,write,read,verify,erase,enable-protection,disable-protection,check-protection,status-register}
                         command to execute
 
 optional arguments:
   -h, --help            show this help message and exit
   -d DEVICE             serial port to communicate with
   -f FILENAME           file to read from / write to
-  -l LENGTH             length to read/write in kibi bytes (factor 1024)
+  -l LENGTH             length to read/write in bytes
   --rate BAUD_RATE      baud-rate of serial connection
   --flash-offset FLASH_OFFSET
                         offset for flash read/write in bytes
   --file-offset FILE_OFFSET
                         offset for file read/write in bytes
+  --debug {off,normal,verbose}
+                        enable debug output
 ```
 
 Troubleshooting
