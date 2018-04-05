@@ -23,6 +23,7 @@ COMMAND_WRITE_PROTECTION_ENABLE = 'p'
 COMMAND_WRITE_PROTECTION_DISABLE = 'u'
 COMMAND_WRITE_PROTECTION_CHECK = 'x'
 COMMAND_STATUS_REGISTER_READ = 'y'
+COMMAND_LOCK_SECURITY_CONFIGURATION = 'z'
 
 WRITE_PROTECTION_NONE = 0x00
 WRITE_PROTECTION_PARTIAL = 0x01
@@ -615,7 +616,7 @@ class SerialProgrammer:
                 logMessage('Configuration is unprotected')
             elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_PARTIAL:
                 logMessage('Configuration is partially protected')
-            elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_FULL:
+            elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_LOCKED:
                 logMessage('Configuration is fully protected')
             elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_UNKNOWN:
                 logMessage('Configuration protection is unknown')
@@ -682,6 +683,20 @@ class SerialProgrammer:
 
         return True
 
+    def lock_security_configuration(self):
+        """Set the SRP1 flag locking the chip security configuration"""
+        self._debug('Command: LOCK_SECURITY')
+
+        # Write command
+        self._sendCommand(COMMAND_LOCK_SECURITY_CONFIGURATION)
+        if not self._waitForMessage(COMMAND_LOCK_SECURITY_CONFIGURATION):
+            self._debug('Invalid / no response for LOCK_SECURITY command')
+            logError('Invalid response')
+            return True
+
+        logOk('Done')
+        return True
+
 
 def printComPorts():
     logMessage('Available COM ports:')
@@ -712,7 +727,7 @@ def main():
 
     parser.add_argument('command', choices=('ports', 'write', 'read', 'verify', 'erase',
                                             'enable-protection', 'disable-protection', 'check-protection',
-                                            'status-register'),
+                                            'status-register', 'lock-security-configuration'),
                         help='command to execute')
 
     args = parser.parse_args()
@@ -750,6 +765,9 @@ def main():
     def read_status_register(args, prog):
         return prog.read_status_register()
 
+    def lock_security_configuration(args, prog):
+        return prog.lock_security_configuration()
+
     commands = {
             'write': write,
             'read': read,
@@ -758,7 +776,8 @@ def main():
             'enable-protection': enable_protection,
             'disable-protection': disable_protection,
             'check-protection': check_protection,
-            'status-register': read_status_register
+            'status-register': read_status_register,
+            'lock-security-configuration': lock_security_configuration
         }
 
     if args.command not in commands:
