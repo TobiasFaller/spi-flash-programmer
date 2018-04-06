@@ -34,10 +34,6 @@ WRITE_PROTECTION_CONFIGURATION_PARTIAL = 0x01
 WRITE_PROTECTION_CONFIGURATION_LOCKED = 0x02
 WRITE_PROTECTION_CONFIGURATION_UNKNOWN = 0x03
 
-DEFAULT_FLASH_SIZE = 4096 * 1024
-DEFAULT_SECTOR_SIZE = 4096
-DEFAULT_PAGE_SIZE = 256
-
 ENCODING = 'iso-8859-1'
 
 DEBUG_NORMAL = 1
@@ -63,11 +59,40 @@ def logDebug(text, type):
         puts(colored.magenta(text))
 
 
-class SerialProgrammer:
-
-    def __init__(self, port, baud_rate, debug='off', sector_size=DEFAULT_SECTOR_SIZE, page_size=DEFAULT_PAGE_SIZE):
+class FlashDevice:
+    def __init__(self, size, sector_size, page_size):
+        self.size = size
         self.sector_size = sector_size
         self.page_size = page_size
+
+CHIP_TYPES = {
+    # 'W25X10': FlashDevice(128 * 1024, 4096, 256),
+    # 'W25X20': FlashDevice(256 * 1024, 4096, 256),
+    # 'W25X40': FlashDevice(512 * 1024, 4096, 256),
+    # 'W25X80': FlashDevice(1024 * 1024, 4096, 256),
+
+    'W25Q16': FlashDevice(2 * 1024 * 1024, 4096, 256),
+    'W25Q32': FlashDevice(4 * 1024 * 1024, 4096, 256),
+    'W25Q64': FlashDevice(8 * 1024 * 1024, 4096, 256),
+
+    # 'AT45DB011': FlashDevice(128 * 1024, 264, 264),
+    # 'AT45DB021': FlashDevice(256 * 1024, 264, 264),
+    # 'AT45DB041': FlashDevice(512 * 1024, 264, 264),
+    # 'AT45DB081': FlashDevice(1024 * 1024, 264, 264),
+
+    'AT45DB161': FlashDevice(2 * 1024 * 1024, 528, 528),
+    'AT45DB321': FlashDevice(4 * 1024 * 1024, 528, 528)
+}
+
+class SerialProgrammer:
+
+    def __init__(self, port, baud_rate, chip, debug='off'):
+        chip_name, chip_data = chip
+
+        self.sector_size = chip_data.sector_size
+        self.page_size =  chip_data.page_size
+        self.flash_size = chip_data.size
+
         self.pages_per_sector = self.sector_size // self.page_size
 
         if debug == 'normal':
@@ -438,8 +463,9 @@ class SerialProgrammer:
             logMessage('Connected to \'%s\'' % version.strip())
             return True
 
-    def writeFromFile(self, filename, flash_offset=0, file_offset=0, length=DEFAULT_SECTOR_SIZE):
+    def writeFromFile(self, filename, flash_offset=0, file_offset=0, length=None):
         """Write the data in the file to the flash"""
+        length = self.flash_size if length is None else length
         if length % self.sector_size != 0:
             logError('length must be a multiple of the sector size %d' % self.sector_size)
             return False
@@ -471,8 +497,9 @@ class SerialProgrammer:
 
         return True
 
-    def readToFile(self, filename, flash_offset=0, length=DEFAULT_FLASH_SIZE):
+    def readToFile(self, filename, flash_offset=0, length=None):
         """Read the data from the flash into the file"""
+        length = self.flash_size if length is None else length
         if length % self.page_size != 0:
             logError('length must be a multiple of the page size %d' % self.page_size)
             return False
@@ -508,11 +535,12 @@ class SerialProgrammer:
             logError('Could not write to file \'%s\'' % filename)
             return True
 
-    def verifyWithFile(self, filename, flash_offset=0, file_offset=0, length=DEFAULT_FLASH_SIZE):
+    def verifyWithFile(self, filename, flash_offset=0, file_offset=0, length=None):
         """Verify the flash content by checking against the file
 
         This method only uses checksums to verify the data integrity.
         """
+        length = self.flash_size if length is None else length
         if length % self.page_size != 0:
             logError('length must be a multiple of the page size %d' % self.page_size)
             return False
@@ -553,8 +581,9 @@ class SerialProgrammer:
             logError('Could not write to file \'%s\'' % filename)
             return True
 
-    def erase(self, flash_offset=0, length=DEFAULT_FLASH_SIZE):
+    def erase(self, flash_offset=0, length=None):
         """Write the data in the file to the flash"""
+        length = self.flash_size if length is None else length
         if length % self.sector_size != 0:
             logError('length must be a multiple of the sector size %d' % self.sector_size)
             return False
@@ -692,13 +721,45 @@ def printComPorts():
     logOk('Done')
 
 
+def printChips():
+    logMessage('Available chips:')
+
+    for i, (chip_name, chip_data) in enumerate(CHIP_TYPES.items()):
+        logMessage('%d: %s %s' % (i+1, chip_name, sizeToUnit(chip_data.size)))
+
+    logOk('Done')
+
+
+def sizeToUnit(size):
+    # See IEC 80000-13:2008
+    UNITS_BYTE = ['B', 'kiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']
+    UNITS_BIT = ['bit', 'kibit', 'Mibit', 'Gibit', 'Tibit', 'Pibit', 'Eibit', 'Zibit', 'Yibit']
+
+    size_bytes = size
+    size_bits = size * 8
+
+    unit_byte = 0
+    unit_bit = 0
+
+    while size_bytes > 1024 and unit_byte + 1 < len(UNITS_BYTE):
+        size_bytes /= 1024
+        unit_byte += 1
+
+    while size_bits > 1024 and unit_bit + 1 < len(UNITS_BYTE):
+        size_bits /= 1024
+        unit_bit += 1
+
+    return ('%d %s (%d %s)' % (size_bits, UNITS_BIT[unit_bit], size_bytes, UNITS_BYTE[unit_byte]))
+
 def main():
     parser = argparse.ArgumentParser(description='Interface with an Arduino-based SPI flash programmer')
-    parser.add_argument('-d', dest='device', default='COM1',
+    parser.add_argument('-d', dest='device', default=None,
                         help='serial port to communicate with')
+    parser.add_argument('-c', dest='chip', default=None,
+                        help='serial chip to program')
     parser.add_argument('-f', dest='filename', default='flash.bin',
                         help='file to read from / write to')
-    parser.add_argument('-l', type=int, dest='length', default=DEFAULT_FLASH_SIZE,
+    parser.add_argument('-l', type=int, dest='length',
                         help='length to read/write in bytes')
 
     parser.add_argument('--rate', type=int, dest='baud_rate', default=115200,
@@ -710,7 +771,8 @@ def main():
     parser.add_argument('--debug', choices=('off', 'normal', 'verbose'), default='off',
                         help='enable debug output')
 
-    parser.add_argument('command', choices=('ports', 'write', 'read', 'verify', 'erase',
+    parser.add_argument('command', choices=('ports', 'chips',
+                                            'write', 'read', 'verify', 'erase',
                                             'enable-protection', 'disable-protection', 'check-protection',
                                             'status-register'),
                         help='command to execute')
@@ -720,8 +782,25 @@ def main():
         printComPorts()
         return
 
+    if args.command == 'chips':
+        printChips()
+        return
+
+    if args.device is None:
+        logError('Please provide a serial port with -d PORT. Use \'ports\' the list all available ports.')
+        return
+
+    if args.chip is None:
+        logError('Please provide a chip type with -c CHIP. Use \'chips\' the list all available chip configurations.')
+        return
+
+    chip = (args.chip, CHIP_TYPES[args.chip])
+    if chip[1] is None:
+        logError('Chip \'%s\' not found in presets' % args.chip)
+        return
+
     try:
-        programmer = SerialProgrammer(args.device, args.baud_rate, args.debug)
+        programmer = SerialProgrammer(args.device, args.baud_rate, chip, args.debug)
     except serial.SerialException:
         logError('Could not connect to serial port %s' % args.device)
         return
