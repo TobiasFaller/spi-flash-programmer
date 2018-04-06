@@ -24,6 +24,7 @@ COMMAND_WRITE_PROTECTION_DISABLE = 'u'
 COMMAND_WRITE_PROTECTION_CHECK = 'x'
 COMMAND_STATUS_REGISTER_READ = 'y'
 COMMAND_LOCK_SECURITY_CONFIGURATION = 'z'
+COMMAND_UNLOCK_SECURITY_CONFIGURATION = 'v'
 
 WRITE_PROTECTION_NONE = 0x00
 WRITE_PROTECTION_PARTIAL = 0x01
@@ -684,13 +685,27 @@ class SerialProgrammer:
         return True
 
     def lock_security_configuration(self):
-        """Set the SRP1 flag locking the chip security configuration"""
+        """Set the SRP1 & SRP0 flag locking the chip security configuration"""
         self._debug('Command: LOCK_SECURITY')
 
         # Write command
         self._sendCommand(COMMAND_LOCK_SECURITY_CONFIGURATION)
         if not self._waitForMessage(COMMAND_LOCK_SECURITY_CONFIGURATION):
             self._debug('Invalid / no response for LOCK_SECURITY command')
+            logError('Invalid response')
+            return True
+
+        logOk('Done')
+        return True
+
+    def unlock_security_configuration(self):
+        """Clear the SRP1 & SRP0 flag unlocking the chip security configuration"""
+        self._debug('Command: UNLOCK_SECURITY')
+
+        # Write command
+        self._sendCommand(COMMAND_UNLOCK_SECURITY_CONFIGURATION)
+        if not self._waitForMessage(COMMAND_UNLOCK_SECURITY_CONFIGURATION):
+            self._debug('Invalid / no response for UNLOCK_SECURITY command')
             logError('Invalid response')
             return True
 
@@ -727,7 +742,8 @@ def main():
 
     parser.add_argument('command', choices=('ports', 'write', 'read', 'verify', 'erase',
                                             'enable-protection', 'disable-protection', 'check-protection',
-                                            'status-register', 'lock-security-configuration'),
+                                            'status-register',
+                                            'lock-security-configuration', 'unlock-security-configuration'),
                         help='command to execute')
 
     args = parser.parse_args()
@@ -754,10 +770,10 @@ def main():
         return prog.erase(args.flash_offset, args.length)
 
     def enable_protection(args, prog):
-        return prog.set_write_protection(True)
+        return prog.set_write_protection(True) and prog.check_write_protection()
 
     def disable_protection(args, prog):
-        return prog.set_write_protection(False)
+        return prog.set_write_protection(False) and prog.check_write_protection()
 
     def check_protection(args, prog):
         return prog.check_write_protection()
@@ -766,7 +782,10 @@ def main():
         return prog.read_status_register()
 
     def lock_security_configuration(args, prog):
-        return prog.lock_security_configuration()
+        return prog.lock_security_configuration() and prog.check_write_protection()
+
+    def unlock_security_configuration(args, prog):
+        return prog.unlock_security_configuration() and prog.check_write_protection()
 
     commands = {
             'write': write,
@@ -777,7 +796,8 @@ def main():
             'disable-protection': disable_protection,
             'check-protection': check_protection,
             'status-register': read_status_register,
-            'lock-security-configuration': lock_security_configuration
+            'lock-security-configuration': lock_security_configuration,
+            'unlock-security-configuration': unlock_security_configuration
         }
 
     if args.command not in commands:

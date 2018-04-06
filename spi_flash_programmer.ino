@@ -18,6 +18,8 @@
 #define COMMAND_WRITE_PROTECTION_DISABLE 'u'
 #define COMMAND_WRITE_PROTECTION_CHECK 'x'
 #define COMMAND_STATUS_REGISTER_READ 'y'
+#define COMMAND_LOCK_SECURITY_CONFIGURATION 'z'
+#define COMMAND_UNLOCK_SECURITY_CONFIGURATION 'v'
 #define COMMAND_ERROR '!'
 
 #define WRITE_PROTECTION_NONE 0x00
@@ -32,7 +34,7 @@
 
 #define VERSION "SPI Flash programmer v1.0"
 
-#define AT45DB161D
+//#define AT45DB161D
 
 #ifdef AT45DB161D
 
@@ -74,6 +76,8 @@ void impl_status_register_read(void);
 void impl_write_protection_enable(void);
 void impl_write_protection_disable(void);
 void impl_write_protection_check(void);
+void impl_lock_security_configuration(void);
+void impl_unlock_security_configuration(void);
 void impl_wait_for_write_enable(void);
 
 uint8_t buffer [PAGE_SIZE];
@@ -191,6 +195,16 @@ void loop()
     impl_write_protection_disable();
     break;
 
+  case COMMAND_LOCK_SECURITY_CONFIGURATION:
+    Serial.print(COMMAND_LOCK_SECURITY_CONFIGURATION); // Echo OK
+    impl_lock_security_configuration();
+    break;
+  
+  case COMMAND_UNLOCK_SECURITY_CONFIGURATION:
+    Serial.print(COMMAND_UNLOCK_SECURITY_CONFIGURATION); // Echo OK
+    impl_unlock_security_configuration();
+    break;
+
   case COMMAND_STATUS_REGISTER_READ:
     Serial.print(COMMAND_STATUS_REGISTER_READ); // Echo OK
     impl_status_register_read();
@@ -208,6 +222,7 @@ void loop()
     Serial.println("  u         : disable write protection");
     Serial.println("  x         : check write protection");
     Serial.println("  y         : read status register");
+    Serial.println("  z         : lock security configuration");
     Serial.println();
     Serial.println("  h         : print buffer CRC-32");
     Serial.println("  l         : display the buffer (in hex)");
@@ -557,7 +572,7 @@ void impl_write_protection_check(void)
   statusRegister |= ((uint32_t) SPI.transfer(RDSR3)) << 16;
   digitalWrite(SS, HIGH);
 
-  if (statusRegister & SRP1) {
+  if ((statusRegister & SRP1) || (statusRegister & SRP0)) {
     write_hex_u8(WRITE_PROTECTION_CONFIGURATION_LOCKED);
   } else {
     write_hex_u8(WRITE_PROTECTION_CONFIGURATION_NONE);
@@ -707,6 +722,66 @@ void impl_status_register_read(void)
   write_hex_u8(statusRegister);
   write_hex_u8(statusRegister2);
   write_hex_u8(statusRegister3);
+}
+
+void impl_lock_security_configuration(void)
+{
+  uint8_t statusRegister;
+  uint8_t statusRegister2;
+
+  // Read status register 1
+  digitalWrite(SS, LOW);
+  SPI.transfer(RDSR);
+  statusRegister = SPI.transfer(RDSR);
+  digitalWrite(SS, HIGH);
+
+  // Read status register 2
+  digitalWrite(SS, LOW);
+  SPI.transfer(RDSR2);
+  statusRegister2 = SPI.transfer(RDSR2);
+  digitalWrite(SS, HIGH);
+
+  // Set chip as writable
+  digitalWrite(SS, LOW);
+  SPI.transfer(WREN); // Write enable
+  digitalWrite(SS, HIGH);
+  delay(10);
+
+  digitalWrite(SS, LOW);
+  SPI.transfer(WRSR);                          // Write register instruction
+  SPI.transfer(statusRegister | SRP0);         // Force SR1 to 1XXXXXXX
+  SPI.transfer(statusRegister2 | (SRP1 >> 8)); // Force SR2 to XXXXXXX1
+  digitalWrite(SS, HIGH);
+}
+
+void impl_unlock_security_configuration(void)
+{
+  uint8_t statusRegister;
+  uint8_t statusRegister2;
+
+  // Read status register 1
+  digitalWrite(SS, LOW);
+  SPI.transfer(RDSR);
+  statusRegister = SPI.transfer(RDSR);
+  digitalWrite(SS, HIGH);
+
+  // Read status register 2
+  digitalWrite(SS, LOW);
+  SPI.transfer(RDSR2);
+  statusRegister2 = SPI.transfer(RDSR2);
+  digitalWrite(SS, HIGH);
+
+  // Set chip as writable
+  digitalWrite(SS, LOW);
+  SPI.transfer(WREN); // Write enable
+  digitalWrite(SS, HIGH);
+  delay(10);
+
+  digitalWrite(SS, LOW);
+  SPI.transfer(WRSR);                           // Write register instruction
+  SPI.transfer(statusRegister & ~SRP0);         // Force SR1 to 0XXXXXXX
+  SPI.transfer(statusRegister2 & ~(SRP1 >> 8)); // Force SR2 to XXXXXXX0
+  digitalWrite(SS, HIGH);
 }
 
 #else
