@@ -50,11 +50,6 @@ void dump_buffer(void);
 void dump_buffer_crc(void);
 int8_t read_into_buffer(void);
 
-void erase_all(void);
-void erase_sector(uint32_t address);
-void read_page(uint32_t address);
-void write_page(uint32_t address);
-
 uint32_t crc_buffer(void);
 void wait_for_write_enable(void);
 
@@ -119,7 +114,7 @@ void loop()
     break;
 
   case COMMAND_FLASH_ERASE_ALL:
-    erase_all();
+    impl_erase_chip();
     Serial.print(COMMAND_FLASH_ERASE_ALL); // Echo OK
     break;
 
@@ -129,7 +124,7 @@ void loop()
       break;
     }
 
-    erase_sector(address);
+    impl_erase_sector(address);
     Serial.print(COMMAND_FLASH_ERASE_SECTOR); // Echo OK
     break;
 
@@ -139,7 +134,7 @@ void loop()
       break;
     }
 
-    read_page(address);
+    impl_read_page(address);
     Serial.print(COMMAND_FLASH_READ); // Echo OK
     dump_buffer_crc();
     break;
@@ -150,7 +145,7 @@ void loop()
       break;
     }
 
-    write_page(address);
+    impl_write_page(address);
     Serial.print(COMMAND_FLASH_WRITE); // Echo OK
     break;
 
@@ -220,60 +215,6 @@ void loop()
   }
 
   Serial.flush();
-} 
-
-void read_page(uint32_t address)
-{
-  // Send read command
-  digitalWrite(SS, LOW);
-  impl_read_page(address);
-
-  // Release chip, signal end transfer
-  digitalWrite(SS, HIGH);
-} 
-
-void write_page(uint32_t address)
-{
-  digitalWrite(SS, LOW);
-  impl_enable_write();
-  digitalWrite(SS, HIGH);
-  delay(10);
-
-  digitalWrite(SS, LOW);
-  impl_write_page(address);
-  digitalWrite(SS, HIGH);
-  delay(1); // Wait for 1 ms
-
-  impl_wait_for_write_enable();
-}
-
-void erase_all()
-{
-  digitalWrite(SS, LOW);
-  impl_enable_write();
-  digitalWrite(SS, HIGH);
-  delay(10); // Wait for 10 ms
-
-  digitalWrite(SS, LOW);
-  impl_erase_chip();
-  digitalWrite(SS, HIGH);
-  delay(1); // Wait for 1 ms
-
-  impl_wait_for_write_enable();
-}
-
-void erase_sector(uint32_t address)
-{
-  digitalWrite(SS, LOW);
-  impl_enable_write();
-  digitalWrite(SS, HIGH);
-  delay(10);
-
-  digitalWrite(SS, LOW);
-  impl_erase_sector(address);
-  digitalWrite(SS, HIGH);
-
-  impl_wait_for_write_enable();
 }
 
 void dump_buffer(void)
@@ -482,21 +423,41 @@ void impl_enable_write(void)
 
 void impl_erase_chip(void)
 {
+  digitalWrite(SS, LOW);
+  impl_enable_write();
+  digitalWrite(SS, HIGH);
+  delay(10); // Wait for 10 ms
+
+  digitalWrite(SS, LOW);
   SPI.transfer(CHIP_ERASE);
+  digitalWrite(SS, HIGH);
+  delay(1); // Wait for 1 ms
+
+  impl_wait_for_write_enable();
 }
 
 void impl_erase_sector(uint32_t address)
 {
+  digitalWrite(SS, LOW);
+  impl_enable_write();
+  digitalWrite(SS, HIGH);
+  delay(10);
+
+  digitalWrite(SS, LOW);
   SPI.transfer(SECTOR_ERASE);            // sector erase instruction
   SPI.transfer((address & 0x0FF0) >> 4); // bits 23 to 16
   SPI.transfer((address & 0x000F) << 4); // bits 15 to 8
   SPI.transfer(0);                       // bits 7 to 0
+  digitalWrite(SS, HIGH);
+
+  impl_wait_for_write_enable();
 }
 
 void impl_read_page(uint32_t address)
 {
   uint16_t counter;
 
+  digitalWrite(SS, LOW);
   SPI.transfer(READ);                  // read instruction
   SPI.transfer((address >> 8) & 0xFF); // bits 23 to 16
   SPI.transfer(address & 0xFF);        // bits 15 to 8
@@ -506,12 +467,21 @@ void impl_read_page(uint32_t address)
   for(counter = 0; counter < PAGE_SIZE; counter++) {
     buffer[counter] = SPI.transfer(0xff);
   }
+
+  // Release chip, signal end transfer
+  digitalWrite(SS, HIGH);
 }
 
 void impl_write_page(uint32_t address)
 {
   uint16_t counter;
 
+  digitalWrite(SS, LOW);
+  impl_enable_write();
+  digitalWrite(SS, HIGH);
+  delay(10);
+
+  digitalWrite(SS, LOW);
   SPI.transfer(WRITE);                 // write instruction
   SPI.transfer((address >> 8) & 0xFF); // bits 23 to 16
   SPI.transfer(address & 0xFF);        // bits 15 to 8
@@ -520,6 +490,10 @@ void impl_write_page(uint32_t address)
   for (counter = 0; counter < PAGE_SIZE; counter++) {
     SPI.transfer(buffer[counter]);
   }
+  digitalWrite(SS, HIGH);
+  delay(1); // Wait for 1 ms
+
+  impl_wait_for_write_enable();
 }
 
 void impl_wait_for_write_enable(void)
@@ -713,54 +687,77 @@ void impl_status_register_read(void)
 
 void impl_enable_write(void)
 {
+  digitalWrite(SS, LOW);
   SPI.transfer(0x3D); // disable write protection
   SPI.transfer(0x2A);
   SPI.transfer(0x7F);
   SPI.transfer(0x9A);
+  digitalWrite(SS, HIGH);
 }
 
 void impl_erase_chip(void)
 {
+  digitalWrite(SS, LOW);
   SPI.transfer(0xC7); // chip erase
   SPI.transfer(0x94);
   SPI.transfer(0x80);
   SPI.transfer(0x9A);
+  digitalWrite(SS, HIGH);
 }
 
 void impl_erase_sector(uint32_t address)
 {
+  digitalWrite(SS, LOW);
   SPI.transfer(0x81); // page erase
   SPI.transfer((address & 0x0FC0) >> 6);
   SPI.transfer((address & 0x003F) << 2);
   SPI.transfer(0x00);
+  digitalWrite(SS, HIGH);
 }
 
 void impl_read_page(uint32_t address)
 {
+  uint16_t counter;
+
+  digitalWrite(SS, LOW);
   SPI.transfer(0xD2); // read without buffer
   SPI.transfer((address & 0x0FC0) >> 6);
   SPI.transfer((address & 0x003F) << 2);
   SPI.transfer(0x00);
+
+  // Transfer 4 dummy bytes
+  for(counter = 0; counter < 4; counter++) {
+    SPI.transfer(0xff);
+  }
+
+  // Transfer a dummy page to read data
+  for(counter = 0; counter < PAGE_SIZE; counter++) {
+    buffer[counter] = SPI.transfer(0xff);
+  }
+  digitalWrite(SS, HIGH);
 }
 
 void impl_write_page(uint32_t address)
 {
   uint16_t counter;
 
+  digitalWrite(SS, LOW);
   SPI.transfer(0x84); // write buffer 1
   SPI.transfer(0x00);
   SPI.transfer(0x00);
   SPI.transfer(0x00);
   SPI.transfer(0x00);
-
   for (counter = 0; counter < PAGE_SIZE; counter++) {
     SPI.transfer(buffer[counter]);
   }
+  digitalWrite(SS, HIGH);
 
+  digitalWrite(SS, LOW);
   SPI.transfer(0x83); // write buffer 1 to memory with erase
   SPI.transfer((address & 0x0FC0) >> 6);
   SPI.transfer((address & 0x003F) << 2);
   SPI.transfer(0x00);
+  digitalWrite(SS, HIGH);
 }
 
 void impl_wait_for_write_enable(void)
