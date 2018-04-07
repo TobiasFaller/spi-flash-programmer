@@ -631,7 +631,7 @@ class SerialProgrammer:
             elif write_protection == WRITE_PROTECTION_FULL:
                 logMessage('Flash content is fully protected')
             elif write_protection == WRITE_PROTECTION_UNKNOWN:
-                logMessage('Flash content protection is UNKNOWN')
+                logMessage('Flash content protection is unknown')
             else:
                 logError('Unknown flash protection status')
 
