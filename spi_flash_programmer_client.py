@@ -1,243 +1,780 @@
+#!/bin/python3
+
 import time
 import serial
 import argparse
 import binascii
-import sys
 
-MAX_SIZE = 16 * 1024 * 1024
-SECTOR_SIZE = 4096
+import serial.tools.list_ports as list_ports
 
-class NoResponse(Exception):
-	pass
+from clint.textui import colored, puts, progress
 
-def decodeHex(hexBytes):
-	return binascii.unhexlify(hexBytes)
+COMMAND_HELLO = '>'
 
-def encodeHex(data):
-	return binascii.hexlify(data)
+COMMAND_BUFFER_CRC = 'h'
+COMMAND_BUFFER_LOAD = 'l'
+COMMAND_BUFFER_STORE = 's'
 
-class SerialChatChat:
-	def __init__(self, filename):
-		self.sock = serial.Serial(filename, 115200, timeout=1)
-		# Wait for the Arduino bootloader
-		time.sleep(2)
-	
-	def _readCRC(self):
-		crc = b''
-		self.sock.flushInput()
-		self.sock.write(b'c')
-		while not crc.endswith(b'\r\n'):
-			crc += self.sock.read(1)
+COMMAND_FLASH_READ = 'r'
+COMMAND_FLASH_WRITE = 'w'
+COMMAND_FLASH_ERASE_SECTOR = 'k'
 
-		return int(crc, 16)
+COMMAND_WRITE_PROTECTION_ENABLE = 'p'
+COMMAND_WRITE_PROTECTION_DISABLE = 'u'
+COMMAND_WRITE_PROTECTION_CHECK = 'x'
+COMMAND_STATUS_REGISTER_READ = 'y'
 
-	def _printBuffer(self):
-		crc = b''
-		self.sock.flushInput()
-		self.sock.write(b'd')
-		while not crc.endswith(b'\r\n'):
-			crc += self.sock.read(1)
+WRITE_PROTECTION_NONE = 0x00
+WRITE_PROTECTION_PARTIAL = 0x01
+WRITE_PROTECTION_FULL = 0x02
+WRITE_PROTECTION_UNKNOWN = 0x03
 
-		print ("BUFFER", crc)
-		
-	def _readPageOnce(self, page):
-		# Reads page, returns CRC
-		
-		cmd = 'r%02x%02x' % ((page & 0xff00) >> 8, (page & 0xff))
-		self.sock.write(cmd.encode('iso-8859-1'))
-		self.sock.flush()
-		return self._readCRC()
+WRITE_PROTECTION_CONFIGURATION_NONE = 0x00
+WRITE_PROTECTION_CONFIGURATION_PARTIAL = 0x01
+WRITE_PROTECTION_CONFIGURATION_LOCKED = 0x02
+WRITE_PROTECTION_CONFIGURATION_UNKNOWN = 0x03
 
-	def _readPageMultiple(self, page):
-		# Keep reading until we get two pages reads the same.
-		crc = [self._readPageOnce(page), self._readPageOnce(page)]
-		count = 0
-		while crc[0] != crc[1] and count < 3:
-			print("Retrying read of page %d" % (page))
-			crc.pop(0)
-			crc.append(self._readPageOnce(page))
-			count += 1
+DEFAULT_FLASH_SIZE = 4096 * 1024
+DEFAULT_SECTOR_SIZE = 4096
+DEFAULT_PAGE_SIZE = 256
 
-		if crc[0] != crc[1]:
-			raise Exception()
-		return crc[1]
+ENCODING = 'iso-8859-1'
 
-	def readPage(self, page):
-		self._readPageMultiple(page)
-	
-		# Dump the buffer.
-		self.sock.write(b'd')
+DEBUG_NORMAL = 1
+DEBUG_VERBOSE = 2
 
-		result = []
-		amt_read = 0
-		while amt_read < 512:
-			fromChip = self.sock.read(512 - amt_read)
-			amt_read += len(fromChip)
-			result.append(fromChip)
 
-		result = b''.join(result)
-		assert len(result) == 512, len(result)
-		return decodeHex(result)
+def logMessage(text):
+    puts(colored.white(text))
 
-	def writePage(self, page, data):
-		# Write the page and verify that it was written correctly.
-		expectedCRC = binascii.crc32(data)
 
-		data = encodeHex(data)
-		assert len(data) == 512, (len(data), data)
+def logOk(text):
+    puts(colored.green(text))
 
-		self.sock.write(b'l' + data)
-		self.waitReady()
 
-		# This shouldn't fail if we're using a reliable connection.
-		if self._readCRC() != expectedCRC:
-			raise Exception()
+def logError(text):
+    puts(colored.red(text))
 
-		# Write it, read it back, fail if we can't read what we wrote.
-		cmd = 'w%02x%02x' % ((page & 0xff00) >> 8, (page & 0xff))
-		
-		#self._printBuffer()
-		
-		self.sock.write(cmd.encode('iso-8859-1'))
-		self.sock.flush()
-		self.waitReady()
 
-		writtenCRC = self._readPageMultiple(page)
-		#self._printBuffer()
+def logDebug(text, type):
+    if type == DEBUG_NORMAL:
+        puts(colored.cyan(text))
+    else:  # DEBUG_VERBOSE
+        puts(colored.magenta(text))
 
-		#print("written CRC", hex(writtenCRC), "expected CRC", hex(expectedCRC), page, data)
-		return writtenCRC == expectedCRC
 
-	def waitReady(self, seconds_to_wait=5):
-		self.sock.flushInput()
-		self.sock.write(b'>')
-		self.sock.flush()
+class SerialProgrammer:
 
-		for retry in range(seconds_to_wait):
-			data = self.sock.read(1)
-			if data == b'>':
-				break
-			elif data:
-				print('unexpected', data)
-		else:
-			raise NoResponse()
-	
-	def verify(self, filename, flashStartByte=0, fileStartByte=0):
-		assert flashStartByte % 256 == 0
-		assert fileStartByte % 256 == 0
-		idx = flashStartByte
-		print("Verifying %s with flash start %d and file start %d" % (filename, flashStartByte, fileStartByte))
-		with open(filename, 'rb') as h:
-			h.seek(fileStartByte)
-			while True:
-				sys.stdout.write('\r%d' % (idx))
-				sys.stdout.flush()
+    def __init__(self, port, baud_rate, debug='off', sector_size=DEFAULT_SECTOR_SIZE, page_size=DEFAULT_PAGE_SIZE):
+        self.sector_size = sector_size
+        self.page_size = page_size
+        self.pages_per_sector = self.sector_size // self.page_size
 
-				fromFile = h.read(256)
-				if fromFile == b'':
-					break
-				assert len(fromFile) == 256, len(fromFile)
-				fileCRC = binascii.crc32(fromFile)
+        if debug == 'normal':
+            self.debug = DEBUG_NORMAL
+        elif debug == 'verbose':
+            self.debug = DEBUG_VERBOSE
+        else:  # off
+            self.debug = 0
 
-				for retry in range(3):
-					deviceCRC = self._readPageOnce(idx // 256)
-					if deviceCRC != fileCRC:
-						print("Mismatch %x != %x, retrying" % (deviceCRC, fileCRC))
-					else:
-						break
-				else:
-					raise Exception("Mismatch")
+        self._debug('Opening serial connection')
+        self.sock = serial.Serial(port, baud_rate, timeout=1)
+        self._debug('Serial connection opened successfully')
 
-				idx += 256
+        time.sleep(2)  # Wait for the Arduino bootloader
 
-	def eraseSector(self, sectorNumber):
-		cmd = 's%03x' % (sectorNumber)
-		self.sock.write(cmd.encode('iso-8859-1'))
-		self.waitReady()
+    def _debug(self, message, level=DEBUG_NORMAL):
+        if self.debug >= level:
+            logDebug(message, level)
 
-	def _writeSectorOnce(self, byteOffset, sectorData):
-		assert byteOffset % SECTOR_SIZE == 0
-		assert len(sectorData) == SECTOR_SIZE
-		pageData = []
-		for idx in range(0, SECTOR_SIZE, 256):
-			pageData.append(sectorData[idx:idx+256])
+    def _readExactly(self, length, tries=3):
+        """Read exactly n bytes or return None"""
+        data = b''
+        _try = 0
+        while len(data) < length and _try < tries:
+            new_data = self.sock.read(length - len(data))
+            if new_data == b'':
+                _try += 1
 
-		pageOffset = byteOffset // 256
-		
-		expectedCRCs = [binascii.crc32(page) for page in pageData]
-		actualCRCs   = [self._readPageMultiple(pageOffset + idx) for idx in range(SECTOR_SIZE // 256)]
+            data += new_data
 
-		#print ("CRCS:", [hex(i) for i in expectedCRCs])
-		#print ("CRCS2:", [hex(i) for i in actualCRCs])
-		
-		
-		if expectedCRCs != actualCRCs:
-			print("APAGANDO")
-			self.eraseSector(byteOffset // SECTOR_SIZE)
+        if len(data) != length:
+            return None
 
-		for idx, page in enumerate(pageData):
-			#print("VAI GRAVAR", pageOffset + idx)
-			if not self.writePage(pageOffset + idx, page):
-				return False
+        return data
 
-		return True
+    def _waitForMessage(self, text, tries=3, max_length=100):
+        """Wait for the expected message and return True or return False"""
+        self._debug('Waiting for \'%s\'' % text, DEBUG_VERBOSE)
 
-	def writeFile(self, filename, offset=0):
-		with open(filename, 'rb') as h:
-			data = h.read(MAX_SIZE)
+        data = text.encode(ENCODING)
+        return self._waitFor(len(data), lambda _data: data == _data, tries, max_length)
 
-		print('Writing', filename, 'at', offset)
+    def _waitFor(self, length, check, tries=3, max_length=100):
+        """Wait for the expected message and return True or return False"""
+        data = b''
 
-		for idx in range(0, len(data), SECTOR_SIZE):
-			sys.stdout.write('\r%d of %d' % (idx, len(data)))
-			sys.stdout.flush()
+        _try = 0
+        while _try < tries:
+            new_data = self.sock.read(max(length - len(data), 1))
+            if new_data == b'':
+                _try += 1
 
-			pageData = data[idx:idx + SECTOR_SIZE]
-			assert len(pageData) == SECTOR_SIZE
+            max_length -= len(new_data)
+            if max_length < 0:
+                return False
 
-			for retry in range(3):
-				if self._writeSectorOnce(offset + idx, pageData):
-					break
-				else:
-					print("Retrying")
-			else:
-				raise Exception()
+            self._debug('Recv: \'%s\'' % new_data.decode(ENCODING), DEBUG_VERBOSE)
 
-	def readToFile(self, filename, size, flashStartByte):
-		assert size % 256 == 0
+            data = (data + new_data)[-length:]
+            if check(data):
+                return True
 
-		assert flashStartByte % 256 == 0
-		flashStartPage = flashStartByte // 256
+        return False
 
-		with open(filename, 'wb') as handle:
-			for idx in range(0, size, 256):
-				sys.stdout.write('\r%d of %d' % (idx, size))
-				sys.stdout.flush()
+    def _getUntilMessage(self, text, tries=3, max_length=100):
+        """Wait for the expected message and return the data received"""
+        self._debug('Reading until \'%s\'' % text, DEBUG_VERBOSE)
 
-				page = idx // 256
+        data = text.encode(ENCODING)
+        return self._getUntil(len(data), lambda _data: data == _data, tries, max_length)
 
-				pageData = self.readPage(page + flashStartPage)
-				handle.write(pageData)
-	
+    def _getUntil(self, length, check, tries=3, max_length=1000):
+        """Wait for the expected message and return the data received"""
+        data = b''
+        message = b''
+
+        _try = 0
+        while _try < tries:
+            new_data = self.sock.read(max(length - len(message), 1))
+            if new_data == b'':
+                _try += 1
+
+            max_length -= len(new_data)
+            if max_length < 0:
+                return None
+
+            self._debug('Recv: \'%s\'' % new_data.decode(ENCODING), DEBUG_VERBOSE)
+
+            message = (message + new_data)[-length:]
+            data += new_data
+            if check(message):
+                return data[:-len(message)]
+
+        return None
+
+    def _sendCommand(self, command):
+        self._debug('Send: \'%s\'' % command, DEBUG_VERBOSE)
+
+        self.sock.write(command.encode(ENCODING))
+        self.sock.flush()
+
+    def _eraseSector(self, sector):
+        self._debug('Command: ERASE_SECTOR %d' % sector)
+
+        self._sendCommand('%s%08x' % (COMMAND_FLASH_ERASE_SECTOR, sector))
+        return self._waitForMessage(COMMAND_FLASH_ERASE_SECTOR)
+
+    def _readCRC(self):
+        self._debug('Command: BUFFER_CRC')
+
+        # Write crc check
+        self._sendCommand(COMMAND_BUFFER_CRC)
+
+        # Wait for crc start
+        if not self._waitForMessage(COMMAND_BUFFER_CRC):
+            self._debug('Invalid / no response for BUFFER_CRC command')
+            return None
+
+        crc = self._readExactly(8).decode(ENCODING)
+        if crc is None:
+            self._debug('Invalid / no CRC response')
+            return None
+
+        try:
+            return int(crc, 16)
+        except ValueError:
+            self._debug('Could not decode CRC')
+            return None
+
+    def _loadPageOnce(self, page, tries=3):
+        """Read a page into the internal buffer"""
+        self._debug('Command: FLASH_READ %d' % page)
+
+        # Reads page
+        self._sendCommand('%s%08x' % (COMMAND_FLASH_READ, page))
+
+        # Wait for read acknowledge
+        if not self._waitForMessage(COMMAND_FLASH_READ):
+            self._debug('Invalid / no response for FLASH_READ command')
+            return None
+
+        crc = self._readExactly(8).decode(ENCODING)
+        if crc is None:
+            self._debug('Invalid / no CRC response')
+            return None
+
+        try:
+            return int(crc, 16)
+        except ValueError:
+            self._debug('Could not decode CRC')
+            return None
+
+    def _loadPageMultiple(self, page, tries=3):
+        """Read a page into the internal buffer
+
+        Keeps reading until we get two page reads the same checksum.
+        """
+        self._debug('Command: FLASH_READ_MULTIPLE %d' % page)
+
+        crc_list = []
+        _try = 0
+
+        while _try < tries:
+            crc = self._loadPageOnce(page, tries)
+            if crc is None:
+                _try += 1
+                continue
+
+            if len(crc_list) >= 1:
+                if crc in crc_list:
+                    self._debug('CRC is valid')
+                    return crc
+                else:
+                    _try += 1
+
+            crc_list.append(crc)
+
+        self._debug('CRC reads did not match once')
+        return None
+
+    def _readPage(self, page, tries=3):
+        """Read a page from the flash and receive it's contents"""
+        self._debug('Command: FLASH_READ_PAGE %d' % page)
+
+        # Load page into the buffer
+        crc = self._loadPageMultiple(page, tries)
+
+        for _ in range(tries):
+            # Dump the buffer
+            self._sendCommand(COMMAND_BUFFER_LOAD)
+
+            # Wait for data start
+            if not self._waitForMessage(COMMAND_BUFFER_LOAD):
+                self._debug('Invalid / no response for BUFFER_LOAD command')
+                continue
+
+            # Load successful -> read sector with 2 nibbles per byte
+            page_data = self._readExactly(self.page_size * 2)
+            if page_data is None:
+                self._debug('Invalid / no response for page data')
+                continue
+
+            try:
+                data = binascii.a2b_hex(page_data.decode(ENCODING))
+                if crc == binascii.crc32(data):
+                    self._debug('CRC did match with read data')
+                    return data
+                else:
+                    self._debug('CRC did not match with read data')
+                    continue
+
+            except TypeError:
+                self._debug('CRC could not be parsed')
+                continue
+
+        self._debug('Page read tries exceeded')
+        return None
+
+    def _writePage(self, page, data):
+        """Write a page into the buffer and instruct a page write operation
+
+        This operation checks the written data with a generated checksum.
+        """
+        assert len(data) == self.page_size, (len(data), data)
+
+        # Write the page and verify that it was written correctly.
+        expected_crc = binascii.crc32(data)
+        encoded_data = binascii.b2a_hex(data)
+
+        self._sendCommand(COMMAND_BUFFER_STORE + encoded_data.decode(ENCODING))
+        if not self._waitForMessage(COMMAND_BUFFER_STORE):
+            self._debug('Invalid / no response for BUFFER_STORE command')
+            return False
+
+        # This shouldn't fail if we're using a reliable connection.
+        crc = self._readExactly(8).decode(ENCODING)
+        if crc is None:
+            self._debug('Invalid / no CRC response for buffer write')
+            return None
+
+        try:
+            if int(crc, 16) != expected_crc:
+                return None
+        except ValueError:
+            self._debug('Could not decode CRC')
+            return None
+
+        # Write page
+        self._sendCommand('%s%08x' % (COMMAND_FLASH_WRITE, page))
+        time.sleep(.2)  # Sleep 200 ms
+
+        if not self._waitForMessage(COMMAND_FLASH_WRITE):
+            self._debug('Invalid / no response for FLASH_WRITE command')
+            return False
+
+        # Read back page
+        # Fail if we can't read what we wrote
+        read_crc = self._loadPageMultiple(page)
+        if read_crc is None:
+            self._debug('Invalid / no CRC response for flash write')
+            return False
+
+        return (read_crc == expected_crc)
+
+    def _writeSectors(self, offset, data, tries=3):
+        """Write one or more sectors with data
+
+        This method clears the sectors before writing to them and checks
+        for valid data via reading each page and comparing the checksum.
+        """
+        assert offset % self.sector_size == 0
+        pages_offset = offset // self.page_size
+        sectors_offset = offset // self.sector_size
+
+        assert len(data) % self.sector_size == 0
+        page_count = len(data) // self.page_size
+        sector_count = len(data) // self.sector_size
+
+        with progress.Bar(expected_size=page_count) as bar:
+            sector_write_attempt = 0
+            sector = 0
+            while sector < sector_count:
+                sector_index = sectors_offset + sector
+
+                bar.show(sector * self.pages_per_sector)
+
+                # Erase sector up to 'tries' times
+                for _ in range(tries):
+                    if self._eraseSector(sector_index):
+                        break
+                else:  # No erase was successful
+                    logError('Could not erase sector 0x%08x' % sector_index)
+                    return False
+
+                for page in range(self.pages_per_sector):
+                    page_data_index = sector * self.pages_per_sector + page
+                    data_index = page_data_index * self.page_size
+                    page_index = pages_offset + page_data_index
+
+                    if self._writePage(page_index, data[data_index: data_index + self.page_size]):
+                        bar.show(page_data_index + 1)
+                        continue
+
+                    sector_write_attempt += 1
+                    if sector_write_attempt < tries:
+                        break  # Retry sector
+
+                    logError('Could not write page 0x%08x' % page_index)
+                    return False
+
+                else:  # All pages written normally -> next sector
+                    sector += 1
+
+        return True
+
+    def _eraseSectors(self, offset, length, tries=3):
+        """Clears one or more sectors"""
+        assert offset % self.sector_size == 0
+        sectors_offset = offset // self.sector_size
+
+        assert length % self.sector_size == 0
+        sector_count = length // self.sector_size
+
+        with progress.Bar(expected_size=sector_count) as bar:
+            for sector in range(sector_count):
+                sector_index = sectors_offset + sector
+
+                bar.show(sector)
+
+                # Erase sector up to 'tries' times
+                for _ in range(tries):
+                    if self._eraseSector(sector_index):
+                        break
+                else:  # No erase was successful
+                    logError('Could not erase sector %08x' % sector_index)
+                    return False
+
+            bar.show(sector_count)
+
+        return True
+
+    def _hello(self):
+        """Send a hello message and expect a version string"""
+        self._debug('Command: HELLO')
+
+        # Write hello
+        self._sendCommand(COMMAND_HELLO)
+
+        # Wait for hello response start
+        if not self._waitForMessage(COMMAND_HELLO):
+            self._debug('Invalid / no response for HELLO command')
+            return None
+
+        message = self._getUntilMessage(COMMAND_HELLO)
+        if message is None:
+            self._debug('No termination for HELLO command')
+            return None
+
+        return message.decode(ENCODING)
+
+    def hello(self):
+        """Send a hello message and print the retrieved version string"""
+        version = self._hello()
+        if version is None:
+            logError('Connected to unknown device')
+            return False
+        else:
+            logMessage('Connected to \'%s\'' % version.strip())
+            return True
+
+    def writeFromFile(self, filename, flash_offset=0, file_offset=0, length=DEFAULT_SECTOR_SIZE):
+        """Write the data in the file to the flash"""
+        if length % self.sector_size != 0:
+            logError('length must be a multiple of the sector size %d' % self.sector_size)
+            return False
+
+        if flash_offset % self.sector_size != 0:
+            logError('flash_offset must be a multiple of the sector size %d' % self.sector_size)
+            return False
+
+        if file_offset < 0:
+            logError('file_offset must be a positive value or 0')
+            return False
+
+        data = None
+        try:
+            with open(filename, 'rb') as file:
+                file.seek(file_offset)
+                data = file.read(length)
+                if len(data) != length:
+                    logError('File is not large enough to read %d bytes' % length)
+                    return True
+        except IOError:
+            logError('Could not read from file \'%s\'' % filename)
+            return True
+
+        if not self._writeSectors(flash_offset, data):
+            logError('Aborting')
+        else:
+            logOk('Done')
+
+        return True
+
+    def readToFile(self, filename, flash_offset=0, length=DEFAULT_FLASH_SIZE):
+        """Read the data from the flash into the file"""
+        if length % self.page_size != 0:
+            logError('length must be a multiple of the page size %d' % self.page_size)
+            return False
+
+        if flash_offset % self.page_size != 0:
+            logError('flash_offset must be a multiple of the page size %d' % self.page_size)
+            return False
+
+        page_count = length // self.page_size
+        pages_offset = flash_offset // self.page_size
+
+        try:
+            with open(filename, 'wb') as file:
+                with progress.Bar(expected_size=page_count) as bar:
+                    for page in range(page_count):
+                        bar.show(page)
+
+                        page_index = pages_offset + page
+                        data = self._readPage(page_index)
+                        if data is not None:
+                            file.write(data)
+                            continue
+
+                        # Invalid data
+                        logError('Could not read page 0x%08x' % page_index)
+                        return True
+
+                    bar.show(page_count)
+
+            logOk('Done')
+            return True
+        except IOError:
+            logError('Could not write to file \'%s\'' % filename)
+            return True
+
+    def verifyWithFile(self, filename, flash_offset=0, file_offset=0, length=DEFAULT_FLASH_SIZE):
+        """Verify the flash content by checking against the file
+
+        This method only uses checksums to verify the data integrity.
+        """
+        if length % self.page_size != 0:
+            logError('length must be a multiple of the page size %d' % self.page_size)
+            return False
+
+        if flash_offset % self.page_size != 0:
+            logError('flash_offset must be a multiple of the page size %d' % self.page_size)
+            return False
+
+        page_count = length // self.page_size
+        pages_offset = flash_offset // self.page_size
+
+        try:
+            with open(filename, 'rb') as file:
+                file.seek(file_offset)
+
+                with progress.Bar(expected_size=page_count) as bar:
+                    for page in range(page_count):
+                        bar.show(page)
+
+                        data = file.read(self.page_size)
+
+                        page_index = pages_offset + page
+                        crc = self._loadPageMultiple(page_index)
+                        if crc is None:
+                            logError('Could not read page 0x%08x' % page_index)
+                            return True
+
+                        if crc == binascii.crc32(data):
+                            logOk('Page 0x%08x OK' % page_index)
+                        else:
+                            logError('Page 0x%08x invalid' % page_index)
+
+                    bar.show(page_count)
+
+            logOk('Done')
+            return True
+        except IOError:
+            logError('Could not write to file \'%s\'' % filename)
+            return True
+
+    def erase(self, flash_offset=0, length=DEFAULT_FLASH_SIZE):
+        """Write the data in the file to the flash"""
+        if length % self.sector_size != 0:
+            logError('length must be a multiple of the sector size %d' % self.sector_size)
+            return False
+
+        if flash_offset % self.sector_size != 0:
+            logError('flash_offset must be a multiple of the sector size %d' % self.sector_size)
+            return False
+
+        if not self._eraseSectors(flash_offset, length):
+            logError('Aborting')
+        else:
+            logOk('Done')
+
+        return True
+
+    def set_write_protection(self, enable=False):
+        """Set or clear the write protection of the flash"""
+        self._debug('Command: WITE_PROTECTION %s' % enable)
+
+        # Write command
+        if enable:  # Enable
+            self._sendCommand(COMMAND_WRITE_PROTECTION_ENABLE)
+            if not self._waitForMessage(COMMAND_WRITE_PROTECTION_ENABLE):
+                self._debug('Invalid / no response for WITE_PROTECTION command')
+                logError('Invalid response')
+                return True
+        else:  # Disable
+            self._sendCommand(COMMAND_WRITE_PROTECTION_DISABLE)
+            if not self._waitForMessage(COMMAND_WRITE_PROTECTION_DISABLE):
+                self._debug('Invalid / no response for WITE_PROTECTION command')
+                logError('Invalid response')
+                return True
+
+        logOk('Done')
+        return True
+
+    def check_write_protection(self):
+        """Check the write protection of the flash"""
+        self._debug('Command: WITE_PROTECTION_CHECK')
+
+        self._sendCommand(COMMAND_WRITE_PROTECTION_CHECK)
+        if not self._waitForMessage(COMMAND_WRITE_PROTECTION_CHECK):
+            self._debug('Invalid / no response for WRITE_PROTECTION_CHECK command')
+            logError('Invalid response')
+            return True
+
+        protection = self._readExactly(4).decode(ENCODING)
+        if protection is None:
+            self._debug('Invalid / no response for protection check')
+            logError('Invalid response')
+            return True
+
+        try:
+            configuration_protection = int(protection[0:2], 16)
+            write_protection = int(protection[2:4], 16)
+
+            if configuration_protection == WRITE_PROTECTION_CONFIGURATION_NONE:
+                logMessage('Configuration is unprotected')
+            elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_PARTIAL:
+                logMessage('Configuration is partially protected')
+            elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_FULL:
+                logMessage('Configuration is fully protected')
+            elif configuration_protection == WRITE_PROTECTION_CONFIGURATION_UNKNOWN:
+                logMessage('Configuration protection is unknown')
+            else:
+                logError('Unknown configuration protection status')
+
+            if write_protection == WRITE_PROTECTION_NONE:
+                logMessage('Flash content is unprotected')
+            elif write_protection == WRITE_PROTECTION_PARTIAL:
+                logMessage('Flash content is partially protected')
+            elif write_protection == WRITE_PROTECTION_FULL:
+                logMessage('Flash content is fully protected')
+            elif write_protection == WRITE_PROTECTION_UNKNOWN:
+                logMessage('Flash content protection is UNKNOWN')
+            else:
+                logError('Unknown flash protection status')
+
+        except ValueError:
+            self._debug('Could not decode protection status')
+            logError('Invalid protection status')
+            return True
+
+        logOk('Done')
+        return True
+
+    def read_status_register(self):
+        """Reads the status register contents"""
+        self._debug('Command: STATUS_REGISTER')
+
+        self._sendCommand(COMMAND_STATUS_REGISTER_READ)
+        if not self._waitForMessage(COMMAND_STATUS_REGISTER_READ):
+            self._debug('Invalid / no response for STATUS_REGISTER command')
+            logError('Invalid response')
+            return True
+
+        length_str = self._readExactly(2).decode(ENCODING)
+        if length_str is None:
+            self._debug('Invalid / no response for status register length')
+            logError('Invalid response')
+            return True
+
+        try:
+            length = int(length_str, 16)
+        except ValueError:
+            self._debug('Could not decode status register length')
+            logError('Invalid register length')
+            return True
+
+        status_str = self._readExactly(length * 2).decode(ENCODING)
+        if status_str is None:
+            self._debug('Invalid / no response for status register check')
+            logError('Invalid response')
+            return True
+
+        try:  # Check if valid status data
+            decoded_status = binascii.a2b_hex(status_str)
+        except TypeError:
+            self._debug('Could not decode status register content')
+            logError('Invalid response')
+            return True
+
+        for offset, status_row in [(i, status_str[i:i+16]) for i in range(0, len(status_str), 16)]:
+            logMessage('%08x: %s' % (offset, ' '.join([status_row[i:i+4] for i in range(0, 16, 4)])))
+
+        return True
+
+
+def printComPorts():
+    logMessage('Available COM ports:')
+
+    for i, port in enumerate(list_ports.comports()):
+        logMessage('%d: %s' % (i+1, port.device))
+
+    logOk('Done')
+
+
 def main():
-	parser = argparse.ArgumentParser(description="Interface with an Arduino-based SPI flash programmer")
-	parser.add_argument('-f', dest='filename')
-	parser.add_argument('-d', dest='device', default='COM28')
-	parser.add_argument('-s', dest='size', default='4096', help="size in KB")
-	parser.add_argument('--flash-offset', dest='flash_offset', default='0', help='offset for flash read/write in bytes')
-	parser.add_argument('--file-offset', dest='file_offset', default='0', help='offset for file read/write in bytes')
-	parser.add_argument('command', choices=('write', 'read', 'verify'))
-	args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='Interface with an Arduino-based SPI flash programmer')
+    parser.add_argument('-d', dest='device', default='COM1',
+                        help='serial port to communicate with')
+    parser.add_argument('-f', dest='filename', default='flash.bin',
+                        help='file to read from / write to')
+    parser.add_argument('-l', type=int, dest='length', default=DEFAULT_FLASH_SIZE,
+                        help='length to read/write in bytes')
 
-	chat = SerialChatChat(args.device)
-	if args.command=='write':
-		chat.writeFile(args.filename, int(args.flash_offset))
-	elif args.command=='read':
-		chat.readToFile(args.filename, int(args.size) * 1024, int(args.flash_offset))
-	elif args.command=='verify':
-		chat.verify(args.filename, int(args.flash_offset), int(args.file_offset))
-	else:
-		raise NotImplementedError()
+    parser.add_argument('--rate', type=int, dest='baud_rate', default=115200,
+                        help='baud-rate of serial connection')
+    parser.add_argument('--flash-offset', type=int, dest='flash_offset', default=0,
+                        help='offset for flash read/write in bytes')
+    parser.add_argument('--file-offset', type=int, dest='file_offset', default=0,
+                        help='offset for file read/write in bytes')
+    parser.add_argument('--debug', choices=('off', 'normal', 'verbose'), default='off',
+                        help='enable debug output')
+
+    parser.add_argument('command', choices=('ports', 'write', 'read', 'verify', 'erase',
+                                            'enable-protection', 'disable-protection', 'check-protection',
+                                            'status-register'),
+                        help='command to execute')
+
+    args = parser.parse_args()
+    if args.command == 'ports':
+        printComPorts()
+        return
+
+    try:
+        programmer = SerialProgrammer(args.device, args.baud_rate, args.debug)
+    except serial.SerialException:
+        logError('Could not connect to serial port %s' % args.device)
+        return
+
+    def write(args, prog):
+        return prog.writeFromFile(args.filename, args.flash_offset, args.file_offset, args.length)
+
+    def read(args, prog):
+        return prog.readToFile(args.filename, args.flash_offset, args.length)
+
+    def verify(args, prog):
+        return prog.verifyWithFile(args.filename, args.flash_offset, args.file_offset, args.length)
+
+    def erase(args, prog):
+        return prog.erase(args.flash_offset, args.length)
+
+    def enable_protection(args, prog):
+        return prog.set_write_protection(True)
+
+    def disable_protection(args, prog):
+        return prog.set_write_protection(False)
+
+    def check_protection(args, prog):
+        return prog.check_write_protection()
+
+    def read_status_register(args, prog):
+        return prog.read_status_register()
+
+    commands = {
+            'write': write,
+            'read': read,
+            'verify': verify,
+            'erase': erase,
+            'enable-protection': enable_protection,
+            'disable-protection': disable_protection,
+            'check-protection': check_protection,
+            'status-register': read_status_register
+        }
+
+    if args.command not in commands:
+        logError('Invalid command \'%d\'' % args.command)
+        parser.print_help()
+        return
+
+    if not programmer.hello():
+        # Unrecognized device
+        parser.print_help()
+        return
+
+    if not commands[args.command](args, programmer):
+        # Command got invalid arguments
+        parser.print_help()
+
 
 if __name__ == '__main__':
-	main()
+    main()
